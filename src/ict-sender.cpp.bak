@@ -1,0 +1,1892 @@
+/*******select.c*********/
+
+/*******Using select() for I/O multiplexing */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <syslog.h>
+#include <stdarg.h>
+#include <signal.h>
+#include <pthread.h>
+#include <libconfig.h++>
+#include <vector>
+#include <string>
+#include <list>
+#include <map>
+#include <set>
+#include <queue>
+#include <cstdio>
+#include <sys/time.h>
+#include <limits>
+#include <sys/un.h>
+
+#include <iostream>
+#include <fstream>
+
+#define STATUS_DEAD 0
+#define STATUS_UNSTABLE 1
+#define STATUS_LIVE 2
+
+using namespace std;
+using namespace libconfig;
+
+struct Datagram{
+	uint32_t time;
+	uint16_t number;
+	string data;
+};
+    
+typedef vector<string> Strings;
+typedef Strings::iterator StringsIterator;
+
+typedef vector<string> CStrings;
+typedef CStrings::const_iterator CStringsIterator;
+
+typedef set<int> CSocketSet;
+typedef CSocketSet::const_iterator CSocketSetIterator;
+
+struct ListeningArgs {
+	int port;
+	string proto;
+	string host;
+	uint16_t mtu;
+};
+
+struct StreamingArgs {
+	int port;
+	string host;
+	string proto;
+	bool autoSuspend;
+	bool suspendOnStart;
+};
+
+struct ControlArgs {
+	int port;
+	string proto;
+	string host;
+};
+    
+struct CleaningArgs {
+	int bufferSize; //sec
+};
+
+ListeningArgs listeningArgs;
+StreamingArgs streamingArgs;
+CleaningArgs cleaningArgs;
+ControlArgs controlArgs;
+
+bool forceLogToFile;
+string logFile;
+string pidFile;
+std::string configFile="sender.cfg";
+
+bool fflag=false, vflag=false;
+bool sendingSuspended=false;
+
+long keptLastTime=0;
+string controlStr;
+bool sendingInitialized=false;
+
+queue<uint16_t> outQueue;
+
+struct socket_t {
+	int socket;
+	struct sockaddr_in local;
+	struct sockaddr_in peer;
+};
+
+class ictDatagram_t {
+	public:
+		char buf[256*256];
+		uint16_t length;
+		const uint16_t getDataSize() const {
+			return length-6;
+		}
+
+		const uint16_t getDataLength() const {
+			return getDataSize();
+		}
+	
+		const uint16_t getNumber() const {
+			return *((uint16_t*)buf);
+		}
+		const uint32_t getTime() const {
+			return *((uint32_t*)&buf[2]);
+		}
+		const char *getData() const {
+			return &buf[6];
+		}
+
+		void setNumber(uint16_t nr) {
+			memcpy(buf,&nr,sizeof(nr));
+		}
+		void setTime(uint32_t time) const {
+			memcpy((char*)&buf[2],&time,sizeof(time));
+		}
+		void setData(const char *data,const int cnt) {
+			memcpy((char*)&buf[6],data,cnt);
+			length=cnt+6;
+		}
+		void setDataLength(uint16_t dataLen) {
+			length=dataLen+6;
+		}
+		
+		char *data() {
+			return &buf[6];
+		}
+		
+		const int size() const {
+			return length;
+		}
+
+		ictDatagram_t() {
+			length=0;
+		}
+		
+		operator char*() {
+			return (char*)&buf;
+		}
+};
+
+class ictStream {
+
+
+
+};
+    
+//typedef vector<socket_> senders_t;
+//typedef senders_t::iterator senders_iterator_t;
+
+int abs(int a) {
+	return a<0?-a:a;
+}
+
+void *streaming (void *);
+void *cleaning (void *);
+
+bool sendControl(const char *data, const int datalen);
+bool sendControl(const string data);
+string processControl (const string Msg,const socket_t sock); //(const string Msg,const int &sock,const struct sockaddr_in *from=NULL,const socklen_t *fromlen=NULL);
+
+Datagram datagramBuffer[65536];
+pthread_mutex_t datagramBufferLock;
+
+bool reinit=true;
+
+int fdmax=0;
+
+int yes = 1;
+/* master file descriptor list */
+fd_set master;
+
+socket_t control={-1};
+socket_t listener={-1};
+socket_t sender={-1};
+
+uint16_t streamingNumber;
+
+pthread_mutex_t streaming_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  streaming_cond  = PTHREAD_COND_INITIALIZER;
+
+const uint32_t MCAST_ADDR=inet_addr("224.0.0.0");
+const uint32_t MCAST_MASK=inet_addr("240.0.0.0");
+
+void *cleaningFcn (void *argPtr);
+
+
+//pthread_mutex_t missRecover_mutex = PTHREAD_MUTEX_INITIALIZER;
+//pthread_cond_t  missRecover_cond  = PTHREAD_COND_INITIALIZER;
+
+void waitFor(pthread_cond_t *var,pthread_mutex_t *mutex) {
+    pthread_mutex_lock(mutex);
+    pthread_cond_wait(var,mutex);
+    pthread_mutex_unlock(mutex);
+}
+
+void releaseWaitFor(pthread_cond_t *var,pthread_mutex_t *mutex) {
+    pthread_mutex_lock(mutex);
+    pthread_cond_signal(var);
+    pthread_mutex_unlock(mutex);
+}
+
+void stringprintf(string &dst, const char *fmt, ...) {
+	char *buffer;
+	va_list ap;
+	va_start(ap, fmt);
+
+	vasprintf(&buffer,fmt, ap);
+	dst=buffer;
+	free(buffer);
+
+	va_end(ap);
+}
+
+string stringprintf(const char *fmt, ...) {
+	char *buffer;
+	string result;
+	va_list ap;
+	va_start(ap, fmt);
+
+	vasprintf(&buffer,fmt, ap);
+	result=buffer;
+	free(buffer);
+
+	va_end(ap);
+	
+	return result;
+}
+
+CStrings split(const string Splitter,const string Str,const int maxCount=std::numeric_limits<int>::max(),int *rest=NULL) {
+	CStrings Result;
+	size_t oldpos,pos=-Splitter.size();
+	oldpos=pos;
+	if (rest!=NULL) *rest=0;
+
+	while( (pos=Str.find(Splitter,pos+Splitter.size())) != string::npos ) {
+		if (Result.size() >= maxCount) {
+			if (rest!=NULL) *rest=2;
+			break;
+		} else { 
+			if (pos-oldpos-Splitter.size()) {
+				Result.push_back(Str.substr(oldpos+Splitter.size(),pos-oldpos-Splitter.size()));
+			}
+			oldpos=pos;
+		}
+	}
+
+	if (oldpos+Splitter.size()<Str.length()) {
+		Result.push_back(Str.substr(oldpos+Splitter.size(),string::npos));
+		if (rest!=NULL && *rest==0) *rest=1;
+	}
+
+	return Result;
+}
+
+bool socketIsConnected(int socket) {
+	int optval;
+	socklen_t optlen = sizeof(optval);
+	int res = getsockopt(socket,SOL_SOCKET,SO_ERROR,&optval, &optlen);
+	return (optval==0 && res==0);
+}
+
+int getSocketType(int socket) {
+	int optval;
+	socklen_t optlen = sizeof(optval);
+	int res = getsockopt(socket,SOL_SOCKET,SO_TYPE,&optval, &optlen);
+	return res==0?optval:-1;
+}
+
+int getSocketLocalPort(int socket) {
+	struct sockaddr_in sin;
+	socklen_t addrlen = sizeof(sin);
+	
+	if(getsockname(socket, (struct sockaddr *)&sin, &addrlen) == 0 && sin.sin_family == AF_INET && addrlen == sizeof(sin)) {
+		return ntohs(sin.sin_port);
+	}
+	
+	return -1;
+}
+/*
+const char *statuses[3]={"dead","unstable","live"};
+void setStatus(StreamingArgs &args,const int status) {
+	if (args.lastStatus!=status) {
+		if (!args.statusFile.empty()) {
+			FILE *fHandle;
+			fHandle=fopen(args.statusFile.c_str(),"w");
+			
+			if (fHandle!=NULL) {
+				fprintf(fHandle,"<?xml version=\"1.0\"?>\n\n<streaming>\n\t<status>%s</status>\n</streaming>",statuses[status]);
+				fclose(fHandle);
+			}
+		}
+		args.lastStatus=status;
+	}
+}
+*/
+
+const char *mons[12]={"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","sep","Oct","Nov","Dec"};
+void makeLog(int priority,const char *fmt,...) {
+	if (priority==LOG_DEBUG && !vflag) return;
+
+	char *buffer;
+	va_list ap;
+	va_start(ap, fmt);
+
+	if (fflag) {
+		if (priority==LOG_ERR) {
+			vfprintf(stderr,fmt,ap);
+			fprintf(stderr,"\n");
+		}
+		else {
+		    vprintf(fmt,ap);
+		    printf("\n");
+		}
+	}
+	else {
+		if (logFile.empty() || logFile.compare("--")==0) {
+			vasprintf(&buffer,fmt, ap);
+			syslog(priority, buffer);
+			free(buffer);
+		} else {
+			time_t seconds=time (NULL);
+			struct tm * timeinfo = localtime ( &seconds );
+
+			FILE *fHandle;
+			fHandle=fopen(logFile.c_str(),"a");
+			
+			if (fHandle!=NULL) {
+				fprintf(fHandle,"%s %02u %02u:%02u:%02u ",mons[timeinfo->tm_mon],timeinfo->tm_mday,timeinfo->tm_hour,timeinfo->tm_min,timeinfo->tm_sec);
+				vfprintf(fHandle,fmt,ap);
+				fputc('\n',fHandle);
+				fclose(fHandle);
+			}
+		}
+	}
+	va_end(ap);
+}
+void readConfig(Config &config) {
+	listeningArgs.mtu=1500;
+	streamingArgs.suspendOnStart=false;
+
+	config.readFile(configFile.c_str());
+	config.lookupValue ("logFile", logFile);
+	config.lookupValue ("pidFile", pidFile);
+	config.lookupValue ("forceLogToFile", forceLogToFile);
+		
+	config.lookupValue ("listen.port", listeningArgs.port);
+	config.lookupValue ("listen.host", listeningArgs.host);
+	config.lookupValue ("listen.proto", listeningArgs.proto);
+	int mtu;
+	config.lookupValue ("listen.mtu", mtu);listeningArgs.mtu=mtu;
+
+	config.lookupValue ("streaming.host",streamingArgs.host);
+	config.lookupValue ("streaming.port",streamingArgs.port);
+	config.lookupValue ("streaming.autoSuspend",streamingArgs.autoSuspend);
+	config.lookupValue ("streaming.suspendOnStart",streamingArgs.suspendOnStart);
+
+
+	config.lookupValue ("control.port", controlArgs.port);
+	config.lookupValue ("control.host", controlArgs.host);
+	
+	if (streamingArgs.port<=0) {
+		makeLog(LOG_WARNING,"streaming port is bad: %d, check configuration file!!!",streamingArgs.port);
+	}
+}
+
+
+void terminate (int param)
+{
+	makeLog (LOG_INFO,"Terminating program...");
+	if (!pidFile.empty()) {
+		remove (pidFile.c_str());
+	}
+	
+	for(int j = 0; j <= fdmax; j++)
+		if(FD_ISSET(j, &master)) {
+			close(j);
+			FD_CLR(j, &master);
+		}
+		
+	pthread_mutex_destroy(&datagramBufferLock);
+	exit(1);
+}
+
+void pushDatagram (const ictDatagram_t &datagram) {
+	uint16_t number=datagram.getNumber();
+	const uint16_t dataLength=datagram.getDataLength();
+	pthread_mutex_lock(&datagramBufferLock);
+	datagramBuffer[number].number=number;
+	datagramBuffer[number].time=datagram.getTime();
+	datagramBuffer[number].data.assign(datagram.getData(),dataLength);
+	pthread_mutex_unlock(&datagramBufferLock);
+
+	releaseWaitFor(&streaming_cond,&streaming_mutex);
+
+//	makeLog(LOG_DEBUG,"Pushing %u",number);
+	//if ($$streaming_sema<1) { $streaming_sema->up(); }
+}
+
+void getDatagram (ictDatagram_t &datagram,const uint16_t number) {
+	pthread_mutex_lock(&datagramBufferLock);
+//	datagramBuffer[number].number=number;
+//	datagramBuffer[number].time=datagram.getTime();
+//	datagramBuffer[number].data.assign(datagram.getData(),dataLength);
+	
+	datagram.setNumber(datagramBuffer[number].number);
+	datagram.setTime(datagramBuffer[number].time);
+	datagram.setData(datagramBuffer[number].data.data(),datagramBuffer[number].data.size());
+	
+	pthread_mutex_unlock(&datagramBufferLock);
+}
+
+int getDatagramLength (const uint16_t number) {
+	pthread_mutex_lock(&datagramBufferLock);
+	int result=datagramBuffer[number].data.length();
+	pthread_mutex_unlock(&datagramBufferLock);
+	
+	return result;
+}
+
+void removeDatagram(uint32_t number) {
+	pthread_mutex_lock(&datagramBufferLock);
+	datagramBuffer[number].number=0;
+	datagramBuffer[number].time=0;
+	datagramBuffer[number].data.clear();
+	pthread_mutex_unlock(&datagramBufferLock);
+}
+
+/*    
+int findFirstNonempty() {
+	for (int i=0;i<65536;i++) {
+		if (!buffer[i].data.empty()) {
+		    return i;
+		}
+	}
+	
+	return -1;
+}
+*/
+
+void clearBuffer () {
+	pthread_mutex_lock(&datagramBufferLock);
+	for (int i=0;i<65536;i++) {
+		datagramBuffer[i].number=0;
+		datagramBuffer[i].time=0;
+		datagramBuffer[i].data.clear();
+	}
+	pthread_mutex_unlock(&datagramBufferLock);
+}
+
+/*
+int getDatagramDataLength (uint16_t number) {
+	return buffer[number].data.length();
+}
+
+void askPacket(const uint16_t number,const uint16_t count,const uint16_t retires) {
+	if (count<1) {return;}
+//	makeLog(LOG_DEBUG,"Asking for missing packet(s): %u %u",number,count);
+	sendControl(stringprintf("SEND %d %d\n",number,count,retires));
+}
+*/
+
+bool sendControl(const string data) {
+	makeLog(LOG_DEBUG,"Sending control {%s}",data.c_str());
+	sendControl(data.c_str(),data.length());
+}
+
+bool sendControl(const char *data,const int datalen) {
+	if (control.socket==-1) {
+	    makeLog(LOG_ERR,"Sender control party is not connected!");
+	    return false;
+	}
+	
+	int sentLength=sendto(control.socket, data, datalen, 0, (struct sockaddr*)&control.peer, sizeof(control.peer));
+
+	if (sentLength != strlen(data)) {
+		const char *buf="CONNECTCONTROL\n";
+		makeLog(LOG_ERR,"ERR: Cannot send control!");
+		sendto(listener.socket, (void*)buf, strlen(buf), 0,(struct sockaddr*)&listener.peer,sizeof(listener.peer));
+		return false;
+	}
+
+	return true;
+}
+
+/*
+void addMissingPacket (uint16_t number) {
+	pthread_mutex_lock(&missingsLock);
+	if (missings.find(number)==missings.end()) missings[number]=0;
+	pthread_mutex_unlock(&missingsLock);
+
+	releaseWaitFor(&missRecover_cond,&missRecover_mutex);
+}
+
+int removeMissingPacket(uint16_t number,bool notReceived=false,bool noLock=false) {
+	int retriesCnt=-1;
+
+	if (!noLock) pthread_mutex_lock(&missingsLock);
+	{
+	    retriesCnt=missings[number];
+	    missings.erase(number);
+
+//	    CMissingsIterator retries;
+//	    retries=missings.find(number);
+//	    if (retries!=missings.end()) {
+//		retriesCnt=retries->second;
+//		missings.erase(retries);
+//	    }
+	}
+	if (!noLock) pthread_mutex_unlock(&missingsLock);
+	
+	if (!notReceived) {
+//		makeLog(LOG_DEBUG,"Missing packet received after %d retry requests",retriesCnt);
+	}
+	
+	return retriesCnt;
+}
+*/
+
+long getUNow() {
+	struct timeval nowStruct;
+	gettimeofday(&nowStruct, NULL);
+		
+	long now=(long)(nowStruct.tv_sec*1000+nowStruct.tv_usec/1000+0.5);
+	
+	return now;
+}
+
+void setControlPeer (const struct sockaddr_in from,const socklen_t *fromlen) {
+	if (control.peer.sin_addr.s_addr!=from.sin_addr.s_addr || control.peer.sin_port!=from.sin_port) {
+		control.peer=from;
+		makeLog(LOG_INFO,"Control from other party connected: %s:%d",inet_ntoa(control.peer.sin_addr),ntohs(control.peer.sin_port));
+		sendControl(stringprintf("GETBUF\n"));
+	}
+
+	control.peer=from;
+}
+
+void processControls (string &msgsStr,const socket_t sock) {
+	int msgsStrEnd;
+	const CStrings msgs=split("\n",msgsStr,std::numeric_limits<int>::max(),&msgsStrEnd);
+
+	for (CStringsIterator msgsItem=msgs.begin();msgsItem!=msgs.end();msgsItem++) {
+	    if (!msgsItem->empty()) {
+		makeLog(LOG_DEBUG,"Processing control {%s}",msgsItem->c_str());
+		string resp=processControl(*msgsItem,sock);
+		if (!resp.empty()) {
+//			makeLog(LOG_DEBUG,"Sending control {%s}",resp.c_str());
+			sendto(control.socket,resp.c_str(),resp.length(),0,(const sockaddr*)&control.peer,sizeof(control.peer));
+		}
+	    }
+	}
+	
+	
+	msgsStr=msgsStrEnd?msgs.back():"";
+}
+
+string processControl (const string Msg,const socket_t sock) {
+	const CStrings data=split(" ",Msg);
+	const CStringsIterator name=data.begin();
+	string result="";
+
+	if (name->compare("SEND")==0) {
+		if (vflag) {makeLog (LOG_DEBUG,"Control message: {$msg1}");}
+
+		uint16_t resendNumber = (data.size()>1)?atoi(data[1].c_str()):0;
+		uint16_t cnt = (data.size()>2)?atoi(data[2].c_str()):0;
+		if (cnt<1) cnt=1;
+
+		bool wasMissing=false;
+		for (int i=0;i<cnt;i++) {
+			bool missing=(getDatagramLength(resendNumber)>0);
+			
+			if (missing) {
+				wasMissing=true;
+				makeLog(LOG_INFO,"Datagram lost: %d",resendNumber);
+				sendControl(stringprintf("SEND_OOB %d\n",resendNumber));
+			} else {
+				ictDatagram_t ictDatagram;
+				getDatagram(ictDatagram,resendNumber);
+			
+				sendto(sender.socket,ictDatagram,ictDatagram.size(),0,(const sockaddr*)&sender.peer,sizeof(sender.peer));
+			}
+			
+			resendNumber++;
+		}
+
+		if (wasMissing) {
+			makeLog(LOG_WARNING,"Packet(s) is out of buffer");
+		}
+	}
+	else if (name->compare("STARTED")==0) {
+		makeLog (LOG_INFO,"Control message: STARTED");
+	}
+	else if (name->compare("KEPT")==0) {
+		keptLastTime=getUNow();
+	}
+	else if (name->compare("SETBUF")==0) {
+		//makelog ("Control message: {$msg1}");
+		int newBufferTime=(data.size()>1)?atoi(data[1].c_str()):-1;
+
+		if (newBufferTime!=-1 && cleaningArgs.bufferSize!=newBufferTime) {
+			cleaningArgs.bufferSize=newBufferTime;
+			makeLog (LOG_INFO,"Buffer is set to new value: %d",cleaningArgs.bufferSize);
+		}
+		return stringprintf("BUFSET %d\n",cleaningArgs.bufferSize);
+	}
+	else if (name->compare("RESETSTREAM")==0) {
+		FD_CLR(sender.socket,&master);
+		int sockType=getSocketType(sender.socket);
+		close(sender.socket);
+
+		if((sender.socket = socket(AF_INET, sockType, 0)) == -1) {
+			makeLog(LOG_ERR,"Unable to recreate sender socket");
+			exit(1);
+		}
+		
+		makeLog (LOG_INFO,"Stream reset requested from receiver");
+		result+=stringprintf("STREAMRESET %d\n",0);
+	}
+	else if (name->compare("SUSPEND")==0) {
+		if (!sendingSuspended) {
+			sendingSuspended=true;
+			makeLog(LOG_INFO,"Sending is supended on receiver request");
+		}
+		
+		return stringprintf("SUSPENDED %d\n",0); //TODO O by malo byt cislo noveho portu na vysielacej strane
+	}
+	else if (name->compare("RESUME")==0) {
+		sendingSuspended=false;
+	
+		return stringprintf("RESUMED %d\n",0); //TODO O by malo byt cislo noveho portu na vysielacej strane
+	}
+	else if (name->compare("CINIT")==0) {
+		int newBufferTime=data.size()>1?atoi(data[1].c_str()):-1;
+		sendingSuspended=false;
+		makeLog(LOG_INFO,"Clinet initialization request from receiver");
+
+		if (newBufferTime!=-1 && cleaningArgs.bufferSize!=newBufferTime) {
+			cleaningArgs.bufferSize=newBufferTime;
+			makeLog (LOG_INFO,"Buffer is set to new value: %d",cleaningArgs.bufferSize);
+			result+=stringprintf("BUFSET %d\n",cleaningArgs.bufferSize);
+		}
+
+		result+=stringprintf("CINITED %d\n",0);//getSocketLocalPort(sender.socket)); //TODO O by malo byt cislo noveho portu na vysielacej strane
+	}
+
+	else if (name->compare("CUNINIT")==0) {
+		clearBuffer();
+		sendingInitialized=false;
+		result+=stringprintf("CUNINITED %d\n",0); //TODO O by malo byt cislo noveho portu na vysielacej strane
+	}
+	else if (name->compare("CONNECTCONTROL")==0) {
+		return "CONTROLCONNECT\n";
+	} else {
+		makeLog(LOG_ERR,"Unknown control: %s",name->c_str());
+	}
+
+
+/*TODO
+	if (*name=="START") {
+		makeLog (LOG_DEBUG,"Control message: {%s}",Msg.c_str());
+		if (from!=NULL) setControlPeer (*from,fromlen);
+		reinit=true;
+//		makeLog(LOG_INFO,"Control from other party connected: %s:%d",inet_ntoa(control.peer.sin_addr),ntohs(control.peer.sin_port));//controlHost2:$controlPort2");
+		return stringprintf("STARTED\nSETBUF %u\n",streamingArgs.bufferSize);
+	} else if (*name=="KEEP") {
+		if (from!=NULL) setControlPeer (*from,fromlen);
+		return stringprintf("KEPT\n",streamingArgs.bufferSize);
+	} else if (*name=="GETBUF") {
+		if (from!=NULL) setControlPeer (*from,fromlen);
+		return stringprintf("BUFGET %u\n",streamingArgs.bufferSize);
+	} else if (*name=="BUFSET") {
+		if (from!=NULL) setControlPeer (*from,fromlen);
+		int remoteBufferSize;
+		sscanf(data[1].c_str(),"%d",&remoteBufferSize);
+		
+		if (remoteBufferSize!=streamingArgs.bufferSize) {
+			makeLog(LOG_ERR,"Sender is unable to set buffer has %d except %d",remoteBufferSize,streamingArgs.bufferSize);
+		}
+	} else if (*name=="CONTROLCONNECT") {
+		if (from!=NULL) setControlPeer (*from,fromlen);
+	} else if (*name=="CINITED") {
+	} else {
+		makeLog(LOG_INFO,"Unknown control: %s",name->c_str());
+	}
+*/
+	
+	//RESETSTREAM je funkcia imlementovana na senderi
+	return result;
+}
+
+int connect(socket_t socketStruct) {
+	return connect(socketStruct.socket,(struct sockaddr *) &socketStruct.peer,sizeof(socketStruct.peer));
+}
+
+int getPidFromFile(const string pidFile) {
+	if (pidFile.empty()) return -1;
+	ifstream pidfile(pidFile.c_str());
+	if (!pidfile.is_open()) return -1;
+	char buf[20];
+	pidfile.getline(buf,sizeof(buf));
+	int pid=atoi(buf);
+	pidfile.close();
+	return pid;
+}
+
+
+int main(int argc, char *argv[]) {
+	//clear the master and temp sets
+	FD_ZERO(&master);
+	
+	char c;
+	int hSocket;
+	uint16_t sendNumber=0;
+	long lastAnnounceTime=0;
+
+	while ((c = getopt (argc, argv, "fvc:")) != -1)
+	switch (c) {
+	    case 'f':
+		fflag = true;
+	    break;
+	    case 'v':
+		vflag = true;
+	    break;
+	    case 'c':
+		configFile = optarg;
+	    break;
+	    case '?':
+		if (optopt == 'c')
+		    fprintf (stderr, "Option -%c requires an argument.\n", optopt);
+		else if (isprint (optopt))
+		    fprintf (stderr, "Unknown option `-%c'.\n", optopt);
+		else
+		    fprintf (stderr, "Unknown option character `\\x%x'.\n", optopt);
+		return 1;
+	    default:
+		abort ();
+	}
+
+	Config config;
+	readConfig(config);
+	
+	int opid=getPidFromFile(pidFile);
+	if (opid>0) {
+		if (kill(opid,0)) {
+			makeLog(LOG_INFO,"Another process is running: %d",opid);
+			pidFile.clear();
+			terminate();
+		}
+	}
+	
+	if (listeningArgs.proto.compare("tcp")==0) {
+		//get the listener
+		if((listener.socket = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+			makeLog(LOG_ERR,"Unable to create listener socket");
+			exit(1);
+		}
+		
+		listener.peer.sin_family = AF_INET;
+		listener.peer.sin_addr.s_addr = inet_addr(listeningArgs.host.c_str());
+		listener.peer.sin_port = htons(listeningArgs.port);
+		memset(&(listener.peer.sin_zero), '\0', 8);
+
+		if (connect(listener.socket,(struct sockaddr *) &listener.peer,sizeof(listener.peer)) < 0) {
+			makeLog(LOG_ERR,"Listener cannot connect!");
+			exit(1);
+		}		
+	} else {
+		const bool mcast=((inet_addr(listeningArgs.host.c_str()) & MCAST_MASK) == MCAST_ADDR);
+
+		//get the listener
+		if((listener.socket = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+			makeLog(LOG_ERR,"Listener Server-socket() error lol!");
+			exit(1);
+		}
+
+		makeLog(LOG_INFO,"Listener Server-socket() is OK...");
+
+		//"address already in use" error message
+		if(setsockopt(listener.socket, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1)
+		{
+			makeLog(LOG_ERR,"Listener setsockopt() error lol!");
+			exit(1);
+		}
+		makeLog(LOG_INFO,"Listener setsockopt() is OK...");
+		
+		// bind
+		listener.local.sin_family = AF_INET;
+		listener.peer.sin_addr.s_addr = listeningArgs.host.empty()?INADDR_ANY:inet_addr(listeningArgs.host.c_str());
+		listener.local.sin_port = htons(listeningArgs.port);
+		memset(&(listener.local.sin_zero), '\0', 8);
+
+		if(bind(listener.socket, (struct sockaddr *)&listener.local, sizeof(listener.local)) == -1)
+		{
+			makeLog(LOG_ERR,"Listener bind() error lol!");
+			exit(1);
+		}
+		
+		if (mcast) {
+			ip_mreq imreq;
+			imreq.imr_multiaddr.s_addr = inet_addr(listeningArgs.host.c_str());
+			imreq.imr_interface.s_addr = INADDR_ANY; // use DEFAULT interface   // JOIN multicast group on default interface
+			int status = setsockopt(listener.socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const void *)&imreq, sizeof(struct ip_mreq));
+			makeLog(LOG_INFO,"Listener is joining multicast %s",listeningArgs.host.c_str());
+		}
+
+		makeLog(LOG_INFO,"Listener is bind to udp://%s:%d",listeningArgs.host.c_str(),listeningArgs.port);
+	}
+	
+	// add the listener to the master set
+	FD_SET(listener.socket, &master);
+	if (listener.socket>fdmax) fdmax=listener.socket;
+
+	if((control.socket = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+		makeLog(LOG_ERR,"Unable to create control socket");
+		exit(1);
+	}
+
+	if (controlArgs.host.empty()) {
+		control.local.sin_family=AF_INET;
+		control.local.sin_addr.s_addr=INADDR_ANY;
+		control.local.sin_port=htons(controlArgs.port);
+		if (bind(control.socket,(struct sockaddr *)&control.local,sizeof(control.local))>=0) 
+			makeLog(LOG_INFO,"Control socket listening for %d",controlArgs.port);
+		else {
+			makeLog(LOG_INFO,"Unable to bind control udp socket for port %d",controlArgs.port);
+			exit(0);
+		}	
+	} else {
+		makeLog(LOG_INFO,"Control is in NAT mode");
+		if (controlArgs.proto.compare("tcp")==0) {
+		
+		} else {
+			control.peer.sin_family = AF_INET;
+			control.peer.sin_port = htons(controlArgs.port);
+			control.peer.sin_addr.s_addr = inet_addr(controlArgs.host.c_str());
+			memset(&(control.peer.sin_zero), '\0', 8);	
+		}
+	}
+
+	FD_SET(control.socket, &master);
+	if (control.socket > fdmax) fdmax=control.socket;
+
+
+	if((sender.socket = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+		makeLog(LOG_ERR,"Unable to create sender socket");
+		exit(1);
+	}
+
+	if (streamingArgs.proto.compare("tcp")==0) {
+		
+	} else {
+		sender.peer.sin_family = AF_INET;
+		sender.peer.sin_port = htons(streamingArgs.port);
+		sender.peer.sin_addr.s_addr = inet_addr(streamingArgs.host.c_str());
+		memset(&(sender.peer.sin_zero), '\0', 8);
+		
+		makeLog(LOG_INFO,"Peer port was set up %s:%d",streamingArgs.host.c_str(),streamingArgs.port);
+	}
+
+	FD_SET(sender.socket, &master);
+	if (sender.socket > fdmax) fdmax=sender.socket;
+
+	openlog("ict-receiver", LOG_PID|LOG_CONS, LOG_USER);
+
+	void (*prev_fn)(int) = signal (SIGTERM,terminate);
+	if (prev_fn==SIG_ERR)
+		makeLog(LOG_ERR,"Unable to set termination funtion"); 
+
+	prev_fn = signal (SIGINT,terminate);
+	if (prev_fn==SIG_ERR)
+		makeLog(LOG_ERR,"Unable to set termination funtion"); 
+
+	if (!fflag) daemon (0,1);
+
+	if (!pidFile.empty()) {
+		ofstream pidfile;
+
+		pidfile.open(pidFile.c_str());
+		pidfile << getpid();
+		pidfile << "\n";
+		pidfile.close();
+	}
+
+	sendingSuspended=streamingArgs.suspendOnStart;
+
+        pthread_t cleaningThread;
+        pthread_t streamingThread;
+
+        if (int errcode=pthread_create(&cleaningThread,NULL,&cleaningFcn,&cleaningArgs)) {
+            makeLog(LOG_ERR,"Uable to create streaming thread (Err=%d)",errcode);
+        }
+
+	sendControl("START");
+	//sendto(sender.socket,"UU",2,0,(const sockaddr*)&sender.peer,sizeof(sender.peer));
+
+	// loop
+	for(;;) {
+		// copy it
+		fd_set read_fds = master;
+
+		if(select(fdmax+1, &read_fds, NULL, NULL, NULL) == -1) {
+			makeLog(LOG_ERR,"Server-select() error lol!");
+			exit(1);
+		}
+
+		//run through the existing connections looking for data to be read
+		for(hSocket = 0; hSocket <= fdmax; hSocket++) {
+			if(FD_ISSET(hSocket, &read_fds))
+			{ // we got one...
+				if(hSocket == listener.socket) {
+					// buffer for client data
+					ictDatagram_t ictDatagram;
+					
+					socklen_t fromlen=sizeof(listener.peer);
+					int recvlen = recvfrom(hSocket, ictDatagram.data(), listeningArgs.mtu, 0,(struct sockaddr*)&listener.peer,&fromlen);
+					ictDatagram.setDataLength(recvlen);
+
+					if (recvlen>0) {
+						if (!sendingSuspended) {
+							ictDatagram.setTime(getUNow());
+							ictDatagram.setNumber(sendNumber);
+
+							pushDatagram (ictDatagram);
+
+							int status=sendto(sender.socket,ictDatagram,ictDatagram.size(),0,(const sockaddr*)&sender.peer,sizeof(sender.peer));
+							if (status<0) {
+								//makeLog(LOG_WARNING,"Sending status error: %d",status);
+							}
+							/*TODO
+							if (defined($sender2)) {
+								$sender2->send($datagram);
+							}*/
+							
+							sendNumber+=1;
+						} else {//if suspended
+							long now=getUNow();
+							if (now-lastAnnounceTime>30*1000) {
+								sendto(sender.socket,"UU",2,0,(const sockaddr*)&sender.peer,sizeof(sender.peer));
+								lastAnnounceTime=now;
+							}
+						} //if suspended
+					} //if recvLen>0
+					else if (recvlen==0){//Client must be reconnected!!!!
+						if (listeningArgs.proto.compare("tcp")==0) {
+							if (socketIsConnected(listener.socket)) {
+								FD_CLR(listener.socket,&master);
+								int sockType=getSocketType(listener.socket);
+								close(listener.socket);
+								if((listener.socket = socket(AF_INET, sockType, 0)) == -1) {
+//								if((listener.socket = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+									makeLog(LOG_ERR,"Unable to recreate listen socket");
+									exit(1);
+								}
+								
+								FD_SET(listener.socket,&master);
+							}
+							
+							if (connect(listener)<0) {
+								sleep(2);
+							}
+						} else {
+							sleep(2);
+						}
+					} //if recvlen==0
+				} //if sock is listener
+				if (hSocket==control.socket) {
+					char cmsg[1500];
+					socklen_t fromlen=sizeof(control.peer);
+					int recvlen = recvfrom(control.socket,cmsg,sizeof(cmsg),0,(struct sockaddr*)&control.peer,&fromlen);
+
+					//if (length($cmsg)<=0) {$controlOtherParty = 0;}
+					//print scalar($controlOtherParty);
+					//print "PP:".$sock -> peerport()."\n";
+					if (recvlen>0) {
+						controlStr.append(cmsg,recvlen);
+						processControls(controlStr,control);
+					}
+				}
+
+				if (hSocket==sender.socket) {
+					char cmsg[1500];
+					socklen_t fromlen=sizeof(sender.peer);
+					int recvlen = recvfrom(sender.socket,cmsg,sizeof(cmsg),0,(struct sockaddr*)&sender.peer,&fromlen);
+
+					controlStr+=cmsg;
+					processControls(controlStr,sender);
+				}
+			}
+		}
+	}
+
+
+
+/*
+        pthread_t streamingThread;
+        pthread_t recoveryThread;
+        pthread_mutex_init(&bufferLock,NULL);
+        pthread_mutex_init(&missingsLock,NULL);
+    
+	
+	if (!pidFile.empty()) {
+		FILE *hPidFile;
+		pid_t pid=getpid();
+		if (hPidFile=fopen(pidFile.c_str(),"w")) {
+		fprintf(hPidFile,"%d\n",pid);
+		fclose(hPidFile);
+		}
+		else {
+			makeLog(LOG_ERR,"Unable to open pidfile: %s",pidFile.c_str());
+		}
+	}
+
+	if (!streamingArgs.unixSocketAddr.empty()) {
+		struct sockaddr_un serv_addr; bzero((char *) &serv_addr, sizeof(serv_addr));
+
+		streamingArgs.unixSocket=socket(AF_UNIX, SOCK_STREAM, 0);
+
+		serv_addr.sun_family = AF_UNIX;
+		strcpy(serv_addr.sun_path, streamingArgs.unixSocketAddr.c_str());
+		int servlen=sizeof(serv_addr.sun_family)+strlen(serv_addr.sun_path);
+		
+		if(bind(streamingArgs.unixSocket,(struct sockaddr *)&serv_addr,servlen)<0)
+			makeLog(LOG_ERR,"Unable to bind unix socket: %s",streamingArgs.unixSocketAddr.c_str());
+		else {
+			makeLog(LOG_INFO,"Listening for unix socket: %s",streamingArgs.unixSocketAddr.c_str());
+			FD_SET(streamingArgs.unixSocket, &master);
+			if (streamingArgs.unixSocket>fdmax) fdmax=streamingArgs.unixSocket;
+			listen(streamingArgs.unixSocket, 5);
+		}
+	} else {
+		streamingArgs.unixSocket=-1;
+	}
+
+        if (int errcode=pthread_create(&streamingThread,NULL,streaming,&streamingArgs)) {
+            makeLog(LOG_ERR,"Uable to create streaming thread (Err=%d)",errcode);
+        }
+
+        if (int errcode=pthread_create(&recoveryThread,NULL,missRecovery,&recoveryArgs)) {
+            makeLog(LOG_ERR,"Uable to create recovery thread (Err=%d)",errcode);
+        }
+        
+					
+					if ( recvlen > 0) {
+					    uint16_t number=buf.getNumber();
+					    if (buf.length<7) {
+							switch (number) {
+								case 21845:
+									makeLog(LOG_INFO,"Init packet was send via normal path");
+									sendControl(stringprintf("CINIT %d",streamingArgs.bufferSize));
+									reinit=true;
+								break;
+							}
+					    } else {
+//						makeLog(LOG_DEBUG,"Receiving number: %u, time: %u",number,buf.getTime());
+						
+						if (reinit) {
+							clearBuffer();
+							offsetTime=buf.getTime()-getUNow();
+							lastNumber=number-1;
+
+							makeLog(LOG_INFO,"Intializing values to: %ld",offsetTime);
+							reinit=false;
+							
+							sendControl(stringprintf("SETBUF %u\n",streamingArgs.bufferSize));
+						}
+
+						uint16_t nextNumber=lastNumber+1;
+
+						if (nextNumber!=number) { //incorrect packet number
+							if (vflag) makeLog(LOG_DEBUG,"Bad packet received: number(%d) except nextNumber(%d)",number,nextNumber);
+
+							uint32_t p_number=number;
+							uint32_t p_lastNumber=lastNumber;
+							uint32_t p_nextNumber=nextNumber;
+
+							if (lastNumber>55536 && number<10000) {  //new packet is after the round
+								p_number+=0x10000;
+							}
+
+							if (number>55536 && lastNumber<10000) {  //new packet is after the round
+								p_lastNumber+=0x10000;
+								p_nextNumber+=0x10000;
+							}
+
+							if (p_number<=p_lastNumber) {
+								if (p_number>=streamingNumber) {
+									if (buffer[number].data.empty()) {
+//										makelog("Missing packet received: $number");
+									} else {
+										makeLog(LOG_DEBUG,"Double packet received: %u",number);
+									}
+
+									pushDatagram(buf);
+									removeMissingPacket(number);
+								}
+								else {
+									makeLog(LOG_INFO,"Packet is too late");
+								}
+							}
+							else {
+								int gap=abs(p_number-p_lastNumber);
+								if (gap>5000) {
+									makeLog(LOG_WARNING,"Warning: gap is bigger than 5000 packets (%d), not retring",gap);
+									lastNumber=number-1; //Last received will be virtually actual number minus-1
+								} else if (gap>20) {
+									makeLog(LOG_WARNING,"Warning: gap is bigger than 20 packets (%d)",gap);
+								}
+
+								lastNumber++;
+								while (lastNumber!=number) {
+									addMissingPacket(lastNumber);
+									removeDatagram(lastNumber);
+									lastNumber++;
+								}
+
+								pushDatagram(buf);
+							}
+						}//incorrect packet number
+						else { //correct packet number
+							if ((number%30) == 0) {
+								if (buf.getTime()<TimeAdjustLastTime) {
+									TimeAdjustCount=0;
+									TimeAdjustSum=0;
+								} else {
+									TimeAdjustSum+=buf.getTime()-getUNow();
+									TimeAdjustCount++;
+								}
+
+								TimeAdjustLastTime=buf.getTime();
+							}
+
+							if (TimeAdjustCount>500) {
+								offsetTime=(long)(0.5+TimeAdjustSum/TimeAdjustCount);
+								makeLog(LOG_DEBUG,"Adjusting new offset: %ld",offsetTime);
+								TimeAdjustCount=0;
+								TimeAdjustSum=0;
+							}
+
+							{ //buffer lock
+								pushDatagram(buf);
+								lastNumber=number;
+							} //#buffer lock is released
+						} //else correct packet number
+					    } //else no control init packet
+					}
+				} //hSocket == listener
+				else if(hSocket == control.socket) {
+					struct sockaddr_in from;
+					socklen_t fromlen=sizeof(from);
+					char buf[1024*8];
+					int rcvd=recvfrom(control.socket,buf,sizeof(buf),0,(struct sockaddr*)&from,&fromlen);
+//					makeLog(LOG_DEBUG,"passing control: %s",buf);
+					processControls(buf,rcvd,control.socket,from,fromlen);
+				}
+				else if (hSocket == streamingArgs.unixSocket) {
+					struct sockaddr_un  cli_addr;
+					socklen_t clilen = sizeof(cli_addr);
+					
+					int newUnixSockClient = accept(streamingArgs.unixSocket,(struct sockaddr *)&cli_addr,&clilen);
+					makeLog(LOG_INFO,"New client connected to unix socket");
+					
+					streamingArgs.clients.insert(newUnixSockClient);
+					FD_SET(newUnixSockClient,&master);
+					if (newUnixSockClient>fdmax) fdmax=newUnixSockClient;
+				}
+				else if ((unixSockClientIter=streamingArgs.clients.find(hSocket))!=streamingArgs.clients.end()) {
+					char buf[256*256];
+					string receivedData;
+					int rcvd=recv(*unixSockClientIter, (void*)&buf, sizeof(buf), 0);
+					if (rcvd > 0) {
+						processControls(buf,rcvd,hSocket);
+					} else {
+						close(*unixSockClientIter);
+						FD_CLR(*unixSockClientIter,&master);
+						streamingArgs.clients.erase(unixSockClientIter);
+						makeLog(LOG_INFO,"Client disconnected from unix socket");
+					}
+				}
+					// handle new connections
+/*
+					addrlen = sizeof(clientaddr);
+					if((newfd = accept(listener, (struct sockaddr *)&clientaddr, &addrlen)) == -1) {
+						makeLog(LOG_ERR,"Server-accept() error lol!");
+					}
+					else {
+						CHttpClientData newClientData;
+						newClientData.bodyStarted=false;
+						clientDataList[newfd]=newClientData;
+
+						makeLog(LOG_INFO,"Server-accept() is OK...",newfd);
+						FD_SET(newfd, &master); // add to master set
+						updateFdMinMax(newfd);
+						makeLog(LOG_INFO,"%s: New connection from %s on socket %d", argv[0], inet_ntoa(clientaddr.sin_addr), newfd);
+					}
+*//*
+			}
+		}
+	}
+*/
+	closelog();
+	return 0;
+}
+
+void *streaming (void *argP) {
+//    $SIG{'KILL'} = sub { threads->exit(0); };
+/*
+    StreamingArgs *args=(StreamingArgs*)argP;
+
+    Datagram datagram;
+    senders_t senders;
+    socket_t control;
+    senders_iterator_t sendersIndex;
+
+    waitFor(&streaming_cond,&streaming_mutex);
+    makeLog(LOG_INFO,"Streamer waiting for buffer fill");
+    sleep(args->bufferSize);
+
+    makeLog(LOG_INFO,"Streamer started with %d sec delay",args->port,args->bufferSize);
+
+    StringsIterator addr,iface;
+
+    for (addr=args->addresses.begin();addr<args->addresses.end();addr++) {
+	for (iface=args->interfaces.begin();iface<args->interfaces.end();iface++) {
+		socket_t sender;
+		makeLog(LOG_INFO,"Creating sender on iface (%s) to %s:%d",iface->empty()?iface->c_str():"default",addr->c_str(),args->port);
+		// get the listener
+		if((sender.socket = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+			makeLog(LOG_ERR,"Uanble to create sender socket");
+			continue;
+		}
+
+		if (setsockopt(sender.socket, IPPROTO_IP, IP_MULTICAST_TTL, &args->ttl, sizeof(args->ttl)) == -1) {
+			makeLog(LOG_ERR,"Unable to set TTL for sender socket");
+			continue;
+		}
+
+		if (!iface->empty()) {
+			struct in_addr interface_addr;
+//			interface_addr.sin_family = AF_INET;
+			interface_addr.s_addr = inet_addr(iface->c_str());
+		
+			if (setsockopt (sender.socket, IPPROTO_IP, IP_MULTICAST_IF, &interface_addr, sizeof(interface_addr)) == -1) {
+				makeLog(LOG_ERR,"Unable to set INTERFACE for sender socket");
+				continue;
+			}
+		}
+
+		sender.peer.sin_family = AF_INET;
+		sender.peer.sin_port = htons(args->port);
+		sender.peer.sin_addr.s_addr = inet_addr(addr->c_str());
+		memset(&(sender.peer.sin_zero), '\0', 8);
+
+		senders.push_back(sender);
+
+	}
+    }
+
+    streamingNumber=0;
+    int stillNegativeTime=0;
+    uint32_t lastTime=0;
+    long measureBytes=0;
+    long measureStartTime=0;
+    long lastMissing=-1;
+
+    while (1) {
+	pthread_mutex_lock(&bufferLock);
+	datagram=buffer[streamingNumber];
+	pthread_mutex_unlock(&bufferLock);
+    
+	if (!datagram.data.empty()) {
+		removeMissingPacket(datagram.number,false);
+
+		long now=getUNow();
+		long streamTime=datagram.time-offsetTime+args->bufferSize*1000;
+
+		long waitTime=streamTime-now;
+		if (waitTime>0) {
+			usleep(waitTime*1000);
+			if (stillNegativeTime>5) {
+				makeLog(LOG_INFO,"Info: wait time is possitive again");
+				stillNegativeTime=0;
+			}
+		} else if(waitTime<-500) {
+			if (stillNegativeTime<5) {
+				makeLog(LOG_WARNING,"Warning: negative wait time %ld (Packet(%u) time:%u, StreamTime:%ld)",waitTime,datagram.number,datagram.time,streamTime);
+			}
+			if (stillNegativeTime<1) {
+				setStatus(streamingArgs,STATUS_UNSTABLE);
+			}
+			stillNegativeTime++;
+		}
+
+		if (lastMissing+5000<now) //Check if last missing packet was before 5 seconds
+			setStatus(streamingArgs,STATUS_LIVE);
+
+		for (sendersIndex=senders.begin();sendersIndex<senders.end();sendersIndex++) {
+			int sentLength=sendto(sendersIndex->socket,datagram.data.data(),datagram.data.length(),0,(const struct sockaddr *)&sendersIndex->peer,sizeof(sendersIndex->peer));
+		}
+
+		for (CSocketSetIterator senderUnixSock=streamingArgs.clients.begin();senderUnixSock!=streamingArgs.clients.end();senderUnixSock++) {
+			int sentLength=send(*senderUnixSock,datagram.data.data(),datagram.data.length(),0);
+		}
+
+		if (lastTime>datagram.time && (lastTime-datagram.time)>0x80000000) {
+			offsetTime+=(std::numeric_limits<unsigned int>::max()+1);
+			makeLog(LOG_INFO,"Time made round");
+		}
+
+		lastTime=datagram.time;
+		removeDatagram(datagram.number);
+
+		streamingNumber++;
+
+		measureBytes+=datagram.data.length();
+		if (measureStartTime+args->measureInterval*1000<now) {
+			float bandwidth=measureBytes/(now-measureStartTime)*8; //bits/ms == kbits/s
+			if (vflag) makeLog(LOG_INFO,"Output bandwidth: %1.2f kbit/s",bandwidth);
+			measureStartTime=now;
+			measureBytes=0;
+		}
+	}
+	else {
+		int nextNonEmpty=findFirstNonempty();
+		
+		if (nextNonEmpty>-1) {
+			uint16_t nextStremingNumber=nextNonEmpty;// streamingNumber+1; //number of next non empty datagram
+
+			if (vflag) makeLog(LOG_INFO,"Found next nonempty: %u",nextStremingNumber);
+			setStatus(streamingArgs,STATUS_UNSTABLE);
+
+			long streamTime=datagram.time-offsetTime+args->bufferSize;
+			long now=getUNow();
+
+			long waitTime=streamTime-now;
+			if (waitTime>200) { //waiting time is bigger than 0.2 second, datagram can arrive
+				usleep(200*1000);
+			} else { //waiting time is too small for waiting, go streaming
+				if (streamingNumber!=nextStremingNumber) {
+					makeLog(LOG_WARNING,"Missing packet(s): %u .. %u",streamingNumber,nextStremingNumber-1);
+					lastMissing=getUNow();
+				}
+				while (streamingNumber!=nextStremingNumber) {
+					streamingNumber++;
+					removeMissingPacket(streamingNumber,true);
+				}
+			}
+		} else {
+			setStatus(streamingArgs,STATUS_DEAD);
+			makeLog(LOG_WARNING,"Warning, buffer is empty, streaming suspended");
+			waitFor(&streaming_cond,&streaming_mutex);
+		} // else 
+	} //else
+    }  //whileloop
+*/
+}
+
+void *keeper (void *argPtr) {
+	makeLog(LOG_DEBUG,"Keeper have started");
+
+	long now=getUNow();
+	while (1) {
+		sendControl("KEEP %ld\n",now);
+
+		sleep(10);
+		if (streamingArgs.autoSuspend) {
+		    if (now-keptLastTime>30000) {
+			if (sendingSuspended!=1) {
+				sendingSuspended=1;
+				makeLog(LOG_WARNING,"Sending is supended, control is not kept");
+			}
+		    }
+		}
+	}
+}
+
+void *cleaningFcn (void *argPtr) {
+	makeLog(LOG_DEBUG,"Cleaner have started");
+	CleaningArgs *args=(CleaningArgs *)argPtr;
+	bool emptyCycle=false;
+
+	for (uint16_t i=0;;i++) {//infinite loop
+		ictDatagram_t datagram;
+		getDatagram (datagram,i);
+		
+		if (datagram.getDataSize()) {
+			emptyCycle=false;
+			uint32_t now=getUNow();
+			uint32_t time=datagram.getTime();
+			int64_t wait=time+args->bufferSize*1000-now;
+		
+			if (wait>cleaningArgs.bufferSize*1000) {
+				wait-=0xFFFFFFFF;
+			}
+			
+			
+		
+			if (wait>0) {
+				usleep(wait*1000);
+			}
+		
+			makeLog(LOG_DEBUG,"Removing datagram %d now=%d,time=%ld,buffer=%d",i,getUNow(),time,args->bufferSize);
+		
+			removeDatagram(i);
+		}
+		
+		if (i==0) {
+			if (emptyCycle) {
+			    sleep(2);
+			}
+			
+			emptyCycle=true;
+			sleep(1);
+		}
+		
+/*		
+		if (
+
+		int index=-1;
+		int delta=-1;
+		for (uint16_t i=0;i<0xFFFF;i++) {
+			my $k_time=unpack("L",substr($buffer[$i],2,4));
+
+
+			my ($l_seconds, $l_time) = gettimeofday;
+			$l_time=int($l_seconds*1000+$l_time/1000);			
+			$l_time%=4294967296;
+#			my $l_time=int(clock_gettime(CLOCK_REALTIME)*1000+0.5); 
+#			makelog("Time: $l_time");
+			$delta=$l_time-$k_time;
+			if ($delta<0) {$delta+=4294967296;}
+
+			if ($delta<($bufferTime*1000)) {
+				break;
+			}
+			else {
+				$index=$i;
+			}
+		}
+		
+		if ($index>=0 && 1) {
+			lock (@buffer);
+			@buffer=@buffer[$index..$#buffer];
+#			makelog("10..$#buffer zo ".scalar(@buffer));
+#			@buffer=@buffer[10..$#buffer];
+#			makelog("Left ".scalar(@buffer));
+			if (scalar(@buffer)) {
+				$firstIndex=unpack("S",$buffer[0]);
+#				makelog("FI: $firstIndex");
+			}
+		}
+*/		
+	}//infinite loop
+}
+
+/*
+$MAX_TO_READ=65535;
+
+my ($logfile)=$confGeneral{'logFile'};
+my $streamingPort:shared=$confGeneral{'streaming'}->{'port'};
+my $streamingHost:shared=$confGeneral{'streaming'}->{'host'};
+my $streamingProto:shared=$confGeneral{'streaming'}->{'proto'};
+my $streamingRate:shared=$confGeneral{'streaming'}->{'maxRate'};
+my $bufferTime:shared=0;#$confGeneral{'streaming'}->{'bufferTime'};
+my $listenPort=$confGeneral{'listen'}->{'port'};
+my $listenProto=$confGeneral{'listen'}->{'proto'};
+my $mtu=defined($confGeneral{'listen'}->{'mtu'})?$confGeneral{'listen'}->{'mtu'}:1500;
+my $listenAddr=$confGeneral{'listen'}->{'address'};
+my $listenMcast=defined($confGeneral{'listen'}->{'mcast'})?$confGeneral{'listen'}->{'mcast'}:'';
+my $controlPort=$confGeneral{'control'}->{'port'};
+my $controlHost=$confGeneral{'control'}->{'host'};
+my $controlProto=$confGeneral{'control'}->{'proto'};
+my $forceLogToFile=$confGeneral{'forceLogToFile'};
+my $controlStr:shared="";
+my $keeper_thr=-1;
+my $keptLastTime:shared=gettimeofday();
+my $verbose:shared=$confGeneral{'verbose'};
+
+my $sendingSuspended:shared=$confGeneral{'streaming'}->{'suspendOnStart'};
+my $controlOtherParty:shared=0;
+#my $sendingInitialized:shared=0;
+my $autoSuspend:shared=$confGeneral{'streaming'}->{'autoSuspend'};
+
+$streamingRate=$streamingRate/8; # bits/s to bytes/s
+
+$sender   = IO::Socket::INET->new(Proto=>"udp",PeerAddr => $streamingHost.":".$streamingPort );
+
+
+if (defined($confGeneral{'copy'})) {
+    $sender2  = IO::Socket::INET->new(Proto=>"udp",PeerAddr => $confGeneral{'copy'}->{'address'}.":".$confGeneral{'copy'}->{'port'});
+    makelog("Sending copy to: ".$confGeneral{'copy'}->{'address'}.":".$confGeneral{'copy'}->{'port'});
+}
+
+if ($listenProto eq 'tcp') {
+    $listener = IO::Socket::INET->new(Proto => 'tcp',PeerHost => $listenAddr,PeerPort => $listenPort) or die "ERROR in Socket Creation : $!\n";
+    makelog("listening for tcp $listenAddr:$listenPort");
+#    or die "ERROR in Socket Creation : $!\n”;
+}
+elsif (!$listenMcast) {
+	$listener = IO::Socket::INET->new(LocalPort=>$listenPort,Proto=>"udp",ReuseAddr=>true) or die "Couldn't be a udp server: $@\n";
+} else {
+	use IO::Socket::Multicast;
+	$listener = IO::Socket::Multicast->new(LocalPort=>$listenPort,Proto=>"udp",ReuseAddr=>true) or die "Couldn't be a udp server: $@\n";
+	$listener -> mcast_add($listenMcast);
+}
+
+
+$keeper_thr = threads->create('sendKeeper');
+
+makelog ("Listening on: ".$listenPort);
+makelog ("Listening control:".$controlPort);
+makelog ("Sending to: $streamingHost:$streamingPort");
+
+#$nr=0xAABB;
+#$data=pack("S",$nr);
+#makelog ("Testing ($nr): ".sprintf("%02x%02x",ord(substr($data,0,1)),ord(substr($data,1,1))));
+
+$readable_handles = new IO::Select($listener,$control,$sender);
+my @buffer:shared=();
+#my $number=65300;
+my $number=int(rand(65000));
+my $firstIndex:shared;
+
+my $streaming_thr = threads->create('cleaner');
+
+sub signal_handler_TERM{
+    $SIG{TERM} =\&signal_handler_TERM;
+    makelog("Terminating");
+    $streaming_thr->kill('KILL')->detach();
+    if ($keeper_thr!=-1) {
+	$keeper_thr->kill('KILL')->detach();
+    }
+
+    close($listener);
+    close($control);
+    close($sender);
+    exit(1);
+}
+$SIG{TERM}=\&signal_handler_TERM;
+
+my $lastAnnounceTime=0;
+
+if ($listener->protocol == 6) {
+	$listener_MAX_TO_READ=int($mtu/188)*188;
+	makelog("Listener MTU: ".$listener_MAX_TO_READ);
+}
+else {
+	$listener_MAX_TO_READ=$MAX_TO_READ;
+}
+
+$SIG{INT} = terminate;
+$SIG{TERM} = terminate;
+
+while (1) {	#Infinite loop
+		# select() blocks until a socket is ready to be read or written
+	my @new_readable = $readable_handles->can_read();# IO::Select->select($readable_handles, undef, undef, 0);
+	# If it comes here, there is at least one handle
+	# to read from or write to. For the moment, worry only about the read side.
+
+	foreach $sock (@new_readable) {
+		if ($sock==$listener) {
+			my $datagram;
+
+			$sock -> recv($datagram,$listener_MAX_TO_READ);
+
+			if (length($datagram)) {
+				if (!$sendingSuspended) {
+					($seconds, $time) = gettimeofday;
+					$time=int($seconds*1000+$time/1000);
+#						my $time=int(clock_gettime(CLOCK_REALTIME)*1000+0.5);
+
+					$time%=4294967296; #Make time rotation
+					$number%=0x10000; #Make number rotation
+					my $data=pack("SL",$number,$time).$datagram;
+#					makelog("Time: ".unpack("L",substr($data,2,4)).", Nr:".unpack("S",substr($data,0,2)));
+#					makeog( "Number,".($time).",$datagram");
+
+					{ #lock applied
+						lock (@buffer);
+						push(@buffer,$data);
+						if (scalar(@buffer)==1) {
+							$firstIndex=$number;
+							makelog("Setting firstIndex from receive loop");
+						}
+					} #lock released
+
+					if ($nontest || $number%20>3) {
+						$sender->send($data);
+#						makelog("Sending $number");
+						$number+=1;
+					}
+				} else {
+					my $now=gettimeofday;
+
+					if ($now-$lastAnnounceTime>30) {
+						$sender->send("UU");
+						$lastAnnounceTime=$now;
+					}
+				}
+
+				if (defined($sender2)) {
+					$sender2->send($datagram);
+				}
+			} else { # Client must be reconnected!!!!
+				my $new_listener = IO::Socket::INET->new(Proto => 'tcp',PeerHost => $listenAddr,PeerPort => $listenPort);
+				if (!$new_listener) {
+					sleep(1);
+				} else {
+					makelog("listening for tcp $listenAddr:$listenPort");
+					close($listener);
+					$readable_handles->remove($listener);
+					$readable_handles->add($listener=$new_listener);
+				}
+			}
+		}
+		if ($sock==$control) {
+			$controlOtherParty = $sock -> recv($cmsg,$MAX_TO_READ);
+
+#			if (length($cmsg)<=0) {$controlOtherParty = 0;}
+#			print scalar($controlOtherParty);
+#			print "PP:".$sock -> peerport()."\n";
+			
+			$controlStr.=$cmsg;
+			processControl($sock);
+		}
+
+		if ($sock==$sender) {
+			$sock -> recv($cmsg,$MAX_TO_READ);
+			$controlStr.=$cmsg;
+			processControl($sock);
+		}
+	}
+}
+
+sub sendControl {
+	my $msg=shift;
+
+	if ($controlOtherParty) {
+#		lock($controlOtherParty);
+		$control -> send($msg,0,$controlOtherParty);
+	}
+	elsif ($control->peerport()) {
+		$control -> send($msg);
+	}
+}
+
+sub sendKeeper {
+	$SIG{'KILL'} = sub { threads->exit(0); };
+
+	$seconds=gettimeofday;
+	while (1) {
+		if ($controlOtherParty) {
+#		    lock($controlOtherParty);
+		    $control -> send("KEEP $seconds\n",0,$controlOtherParty);
+		}
+		elsif ($control->peerport()) {
+		    $control -> send("KEEP $seconds\n");
+		}
+
+		sleep(10);
+		if ($autoSuspend) {
+		    if ($controlOtherParty && gettimeofday()-$keptLastTime>30) {
+			if ($sendingSuspended!=1) {
+				$sendingSuspended=1;
+				makelog("Sending is supended, control is not kept");
+			}
+		    }
+		}
+	}
+}
+
+sub makelog {
+    my $msg=shift;
+
+    my @months=('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec');
+    my ($sec,$min,$hr,$dom,$mon,$year) = localtime(time);
+    $mon=$months[$mon];
+
+    if ($opt_f) {
+	printf ("$mon %2u %02u:%02u:%02u $msg\n",$dom,$hr,$min,$sec);
+    }
+
+    if ($forceLogToFile || $wantDaemon) {
+	open (LOG,">>$logfile");
+        printf LOG "$mon %2u %02u:%02u:%02u $msg\n",$dom,$hr,$min,$sec;
+	close (LOG);
+    } else {
+	printf ("$mon %2u %02u:%02u:%02u $msg\n",$dom,$hr,$min,$sec);
+    }
+}
+
+sub processControl {
+	my $sock1=shift;
+	while (1) {
+		($msg1,$controlStr)=split("\n",$controlStr,2);
+		if (!$msg1) { return 0; }
+		if ($opt_v) {makelog("processing control {$msg1}");}
+		processControlMsg($sock1,$msg1);
+	}
+}
+
+sub processControlMsg {
+	my $sock1=shift;
+	my $msg1=shift;
+
+	@data=split(" ",$msg1);
+	$fcn=shift(@data);
+
+	if ($fcn eq "SEND") {
+		if ($verbose) {makelog ("Control message: {$msg1}");}
+#		makelog("lock");
+		my $resendNumber=shift(@data);
+		my $cnt=shift(@data);
+		if ($cnt<1) {$cnt=1;}
+
+		lock (@buffer);
+		
+		$resendIndex=$resendNumber;
+		if ($resendNumber<$firstIndex && $firstIndex-$resendNumber>(0x10000/2)) {
+			if ($verbose) {makelog("Buffer round $firstIndex $resendNumber");}
+			$resendIndex+=0x10000;
+		}
+
+		my $wasMissing=0;
+		for ($i=0;$i<$cnt;$i++) {
+			my $missing=0;
+			if (($resendIndex+$i)<$firstIndex) {
+				$missing=1;
+				$wasMissing=1;
+				if ($csender) {
+					$sock1->send("SEND_OOB ".($resendNumber+$i)."\n");
+				}
+			}
+		
+			if (!$missing) {
+				$datagram=$buffer[$resendIndex+$i-$firstIndex];
+				if ($datagram) {
+					my $realResendNumber=unpack("S",$datagram);
+					$sender->send($datagram);
+#					makelog("Sending: $realResendNumber");
+					if ($realResendNumber!=($resendNumber+$i)) {
+						makelog("Error resending $realResendNumber except ".($resendNumber+$i));
+					}
+				}
+				else {
+					makelog("Datagram lost: $resendNumber minus $firstIndex".scalar(@buffer));
+				}
+			}
+		}
+
+		if ($wasMissing) {
+			makelog("Packet(s) is out of buffer");
+		}
+#		makelog("unlock");
+	}
+	elsif ($fcn eq "STARTED") {
+		makelog ("Control message: {$msg1}");
+	}
+	elsif ($fcn eq "KEPT") {
+		$keptLastTime=gettimeofday();
+	}
+	elsif ($fcn eq "SETBUF") {
+#		makelog ("Control message: {$msg1}");
+		$newBufferTime=shift(@data);
+
+		if ($bufferTime!=$newBufferTime) {
+			$bufferTime=$newBufferTime;
+			$sock1->send("BUFSET ".$bufferTime."\n");
+			makelog ("Buffer is set to new value: $bufferTime");
+		}
+	}
+	elsif ($fcn eq "RESETSTREAM") {
+		$sender -> close();
+		
+		$sender = IO::Socket::INET->new(Proto=>"udp",PeerAddr => $streamingHost.":".$streamingPort );
+		makelog ("Stream reset requested from receiver");
+		$sock1->send("STREAMRESET ".$sender->sockport ()."\n");
+	}
+	elsif ($fcn eq "SUSPEND") {
+		if ($sendingSuspended!=1) {
+			$sendingSuspended=1;
+			makelog("Sending is supended on receiver request");
+		}
+
+		$sock1->send("SUSPENDED ".$sender->sockport ()."\n");
+	}
+	elsif ($fcn eq "RESUME") {
+		$sendingSuspended=0;
+	
+		$sock1->send("RESUMED ".$sender->sockport ()."\n");
+	}
+	elsif ($fcn eq "CINIT") {
+		$newBufferTime=shift(@data);
+		$sendingSuspended=0;
+		makelog("Clinet initialization request from receiver");
+
+		if ($bufferTime!=$newBufferTime) {
+			$bufferTime=$newBufferTime;
+			$sock1->send("BUFSET ".$bufferTime."\n");
+			makelog ("Buffer is set to new value: $bufferTime");
+		}
+
+		$sock1->send("CINITED ".$sender->sockport ()."\n");
+		
+#		$controlOtherParty=$sock1->peerhost().":".$sock1->peerport();
+#		makelog("Remote part: ".$controlOtherParty);
+	}
+
+	elsif ($fcn eq "CUNINIT") {
+		{ #buffer lock
+		    lock(@buffer);
+		    @buffer=();
+		} # bufferlock released
+		$sendingInitialized=0;
+		$sock1->send("CUNINITED".$sender->sockport ()."\n");
+	}
+	elsif ($fcn eq "CONNECTCONTROL") {
+		sendControl("CONTROLCONNECT");
+	}
+}
+
+sub cleaner {
+	$SIG{'KILL'} = sub { threads->exit(0); };
+	
+	while (1) {
+		my $index=-1;
+		my $delta=-1;
+		for ($i=0;$i<scalar(@buffer);$i++) {
+			my $k_time=unpack("L",substr($buffer[$i],2,4));
+
+
+			my ($l_seconds, $l_time) = gettimeofday;
+			$l_time=int($l_seconds*1000+$l_time/1000);			
+			$l_time%=4294967296;
+#			my $l_time=int(clock_gettime(CLOCK_REALTIME)*1000+0.5); 
+#			makelog("Time: $l_time");
+			$delta=$l_time-$k_time;
+			if ($delta<0) {$delta+=4294967296;}
+
+			if ($delta<($bufferTime*1000)) {
+				break;
+			}
+			else {
+				$index=$i;
+			}
+		}
+		
+		if ($index>=0 && 1) {
+			lock (@buffer);
+			@buffer=@buffer[$index..$#buffer];
+#			makelog("10..$#buffer zo ".scalar(@buffer));
+#			@buffer=@buffer[10..$#buffer];
+#			makelog("Left ".scalar(@buffer));
+			if (scalar(@buffer)) {
+				$firstIndex=unpack("S",$buffer[0]);
+#				makelog("FI: $firstIndex");
+			}
+		}
+		
+		sleep(2);
+	}
+}
+
+sub terminate {
+	close($listener);
+	close($sender);
+	close($control);
+
+        $streaming_thr->kill('KILL')->detach();
+        $keeper_thr->kill('KILL')->detach();
+
+	unlink($pidfile);
+
+	exit(0);
+}
+*/
